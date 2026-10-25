@@ -1,0 +1,474 @@
+"""
+Two-moment kinetic model of ethylene polymerization.
+
+State vector (dimensionless):
+    y = [C, N, P, M, H, Ps, Ns]
+where
+    C  - available catalyst centers
+    N  - growing chains (zeroth moment)
+    P  - monomer units incorporated into growing chains (first moment)
+    M  - monomer (ethylene)
+    H  - hydrogen
+    Ps - monomer units in the final polymer
+    Ns - terminated chains
+
+Dimensionless parameters:
+    alpha = k3 / (k1*M0)      deactivation (termination) rate
+    beta  = k4*H0 / (k1*M0)   chain transfer to hydrogen rate
+    gamma = k2 / k1           propagation-to-initiation ratio
+    eps   = C0 / M0           initial catalyst-to-monomer ratio
+    eta   = C0 / H0           initial catalyst-to-hydrogen ratio
+
+The right-hand side is the closed moment scheme: initiation consumes C and M
+and produces N; propagation adds monomer units to P and consumes M; termination
+and chain transfer remove N and P and feed Ns and Ps; hydrogen is consumed by
+chain transfer. The scheme admits two linear invariants,
+    M + P + Ps = 1,   C + N + Ns = 1,
+which are used below as a check on the numerical integration.
+"""
+
+import os, sys, json, csv, itertools, platform, datetime
+import numpy as np, scipy
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+# ----------------------------------------------------------------------
+# Output directory and a simple logger that writes both to stdout and
+# to a listing file, so that every run leaves a reproducible trace.
+# ----------------------------------------------------------------------
+OUT = 'out'
+os.makedirs(OUT, exist_ok=True)
+_LOG = open(f'{OUT}/listing.txt', 'w', encoding='utf-8')
+
+def log(*args):
+    """Print to stdout and append to the listing file."""
+    s = ' '.join(str(x) for x in args)
+    print(s); _LOG.write(s + '\n'); _LOG.flush()
+
+def fmt(x, p=4):
+    """Compact formatting for logs and LaTeX tables; non-finite -> '--'."""
+    if x is None: return '--'
+    try:
+        if not np.isfinite(x): return '--'
+    except TypeError:
+        return str(x)
+    return f'{x:.{p}g}'
+
+# ----------------------------------------------------------------------
+# Numerical settings
+#   METHOD  - implicit Radau (stiff solver, suitable for the fast
+#             initiation/deactivation scales)
+#   RTOL/ATOL - tight tolerances; ATOL is scaled per component below
+#   N_STOP  - integration is stopped when N falls below this value,
+#             because after that the growing-chain population is
+#             numerically negligible and P/N is ill-conditioned
+#   N_FLOOR - below this N the ratio P/N is not used
+#   TMAX    - safety upper bound on the integration time
+# ----------------------------------------------------------------------
+METHOD  = 'Radau'
+RTOL    = 1e-10
+ATOL    = 1e-13
+N_STOP  = 1e-10
+N_FLOOR = 1e-8
+TMAX    = 1e6
+TYPICAL = 'III'          # run used for the illustrative figure
+SMALL_EPS_RUNS = True    # add runs with eps << 1 (low-conversion regime)
+DO_RK45_CROSSCHECK = True
+
+# ----------------------------------------------------------------------
+# Right-hand side of the dimensionless moment scheme.
+# Inputs are the five dimensionless groups (a=alpha, b=beta, g=gamma,
+# e=eps, h=eta); the state is y = [C, N, P, M, H, Ps, Ns].
+# ----------------------------------------------------------------------
+def rhs(t, y, a, b, g, e, h):
+    C, N, P, M, H, Ps, Ns = y
+    cm = C*M          # initiation flux
+    nm = N*M          # propagation flux
+    return [-cm,                                   # dC/dt
+            cm - a*N - b*N*H,                      # dN/dt
+            e*(cm + g*nm) - a*P - b*P*H,           # dP/dt
+            -e*(cm + g*nm),                        # dM/dt
+            -b*h*N*H,                              # dH/dt
+            a*P + b*P*H,                           # dPs/dt
+            a*N + b*N*H]                           # dNs/dt
+
+# Event functions used by solve_ivp to locate the extrema of N and P
+# and to stop the integration when N becomes negligible.
+def _evN(t, y, a, b, g, e, h):          # dN/dt = 0
+    return y[0]*y[3] - (a + b*y[4])*y[1]
+_evN.direction = -1
+
+def _evP(t, y, a, b, g, e, h):          # dP/dt = 0
+    return e*(y[0]*y[3] + g*y[1]*y[3]) - (a + b*y[4])*y[2]
+_evP.direction = -1
+
+def _evS(t, y, a, b, g, e, h):          # stop when N < N_STOP
+    return y[1] - N_STOP
+_evS.terminal = True
+_evS.direction = -1
+
+def solve(a, b, g, e=1.0, h=1.0, method=METHOD, rtol=RTOL, atol=ATOL, tmax=TMAX):
+    """
+    Integrate the scheme for given dimensionless groups.
+    The absolute tolerance for P and Ps is scaled by eps, because both
+    quantities are of order eps when eps is small.
+    """
+    y0 = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
+    s = min(1.0, e)
+    at = np.array([atol, atol, atol*s, atol, atol, atol*s, atol])
+    return solve_ivp(rhs, [0, tmax], y0, args=(a, b, g, e, h), method=method,
+                     rtol=rtol, atol=at, dense_output=True,
+                     events=(_evN, _evP, _evS))
+
+# ----------------------------------------------------------------------
+# Linearised (low-conversion) prediction of the extrema.
+# In this regime M ~ 1 and H ~ 1, so the growing-chain equation
+# reduces to a linear ODE with constant coefficients; the solution is
+# a difference of two exponentials with rates 1 and kappa0 = alpha+beta.
+# The monomer-unit equation is then driven by N, and the maximum of P
+# is found from the corresponding expression. Used only as a
+# consistency check for Lambda << 1.
+# ----------------------------------------------------------------------
+def linear_pred(a, b, g):
+    k0 = a + b
+    d = k0 - 1.0
+    if abs(d) < 1e-5:
+        tN = 1.0
+        n1 = lambda t: (1 - t)*np.exp(-t)
+        n  = lambda t: t*np.exp(-t)
+        D  = lambda t: g*t**2*np.exp(-t)/2
+    else:
+        tN = np.log(k0)/d
+        n  = lambda t: (np.exp(-t) - np.exp(-k0*t))/d
+        n1 = lambda t: (-np.exp(-t) + k0*np.exp(-k0*t))/d
+        D  = lambda t: g/d*((np.exp(-t) - np.exp(-k0*t))/d - t*np.exp(-k0*t))
+    # f is proportional to dP/dt in the linearised regime
+    f = lambda t: n1(t) + g*n(t) - k0*D(t)
+    tt = np.linspace(tN, tN + 40.0/min(1.0, k0), 40001)
+    ff = f(tt)
+    idx = np.where((ff[:-1] > 0) & (ff[1:] <= 0))[0]
+    tP = brentq(f, tt[idx[0]], tt[idx[0]+1], xtol=1e-14) if len(idx) else np.nan
+    return tN, tP
+
+# ----------------------------------------------------------------------
+# Post-processing of a single solution.
+# Extrema of N and P are taken from the event locations; the maximum
+# of the average chain length L = P/(eps*N) is located by root-finding
+# of dL/dt on a dense grid after max(tN, tP). The remaining entries
+# are the residual concentrations and the quantities used to check
+# the analytical predictions (ordering of extrema, sign of the
+# sufficient condition, bounds on the residuals, invariants).
+# ----------------------------------------------------------------------
+def analyse(sol, a, b, g, e, h):
+    ev = sol.t_events
+    tN = float(ev[0][0]) if len(ev[0]) else np.nan
+    tP = float(ev[1][0]) if len(ev[1]) else np.nan
+    f = sol.sol
+    tend = float(sol.t[-1])
+    C, N, P, M, H, Ps, Ns = sol.y[:, -1]
+    Lam = e*(1 + g/a)          # total monomer capacity per catalyst center
+
+    tL = Lmax = L_end = np.nan
+    N1_ok = None
+    cond_min = cond_tN = cond_tN_rel = np.nan
+
+    if np.isfinite(tN) and np.isfinite(tP):
+        # ---- location of the maximum of L, if any ----
+        t0 = max(tN, tP)
+        grid = np.geomspace(t0, tend, 6000)
+        y = f(grid)
+        good = y[1] > N_FLOOR
+        grid = grid[good]; y = y[:, good]
+        if len(grid) > 2:
+            Lg = y[2]/(e*y[1])
+            G = g*y[3] - y[0]*y[3]*(Lg - 1)/y[1]   # proportional to dL/dt
+            def Gf(t):
+                yy = f(t)
+                return g*yy[3] - yy[0]*yy[3]*(yy[2]/(e*yy[1]) - 1)/yy[1]
+            idx = np.where((G[:-1] > 0) & (G[1:] <= 0))[0]
+            if len(idx):
+                tL = brentq(Gf, grid[idx[0]], grid[idx[0]+1], xtol=1e-14, rtol=1e-13)
+                yy = f(tL); Lmax = float(yy[2]/(e*yy[1]))
+            L_end = float(Lg[-1])
+
+        # ---- is N decreasing on (tN, tP]? ----
+        if tP > tN:
+            tt = np.linspace(tN, tP, 200)[1:]
+            yy = f(tt)
+            dn = yy[0]*yy[3] - (a + b*yy[4])*yy[1]
+            N1_ok = bool(np.all(dn < 0))
+
+        # ---- margin of the sufficient ordering condition on (0, tN] ----
+        tg = np.geomspace(1e-3*tN, tN, 2000)
+        yy = f(tg)
+        Lg2 = yy[2]/(e*np.maximum(yy[1], 1e-300))
+        marg = g*yy[3] - (a + b*yy[4])*(Lg2 - 1)
+        cond_min = float(np.min(marg))
+        cond_tN = float(marg[-1])
+        cond_tN_rel = float(marg[-1]/(g*yy[3][-1]))
+
+    # ---- checks of the analytical bounds ----
+    H_low = float(np.exp(-b*h/a))
+    chk = dict(
+        H_lower=H_low, H_ok=bool(H >= H_low*(1 - 1e-9)),
+        stoich_ok=bool((1 - H) <= h*(1 - C) + 1e-9),
+        M_ok=bool((1 - M) <= Lam + 1e-9),
+        inv_M=float(abs(M + P + Ps - 1)), inv_C=float(abs(C + N + Ns - 1)))
+
+    tNl, tPl = linear_pred(a, b, g)
+    rate_end = float(max(C*M, e*(C*M + g*N*M), b*h*N*H))
+
+    return dict(
+        tN=tN, tP=tP, tL=tL, Lmax=Lmax, L_end=L_end, tend=tend,
+        n_extN=len(ev[0]), n_extP=len(ev[1]), status=int(sol.status),
+        C_inf=float(C), M_inf=float(M), H_inf=float(H),
+        Lterm=float(Ps/(e*Ns)) if Ns > 0 else np.nan, Lam=Lam,
+        cond_min=cond_min, cond_tN=cond_tN, cond_tN_rel=cond_tN_rel,
+        N1_ok=N1_ok, rate_end=rate_end,
+        tN_lin=tNl, tP_lin=tPl,
+        dev_tN=abs(tN - tNl)/tNl if np.isfinite(tN) else np.nan,
+        dev_tP=abs(tP - tPl)/tPl if (np.isfinite(tP) and np.isfinite(tPl)) else np.nan,
+        order_ok=bool(np.isfinite(tN) and np.isfinite(tP) and tP > tN),
+        order_PL_ok=(bool(tP < tL) if np.isfinite(tL) else None),
+        cond20_ok=bool(np.isfinite(cond_min) and cond_min > 0 and cond_tN > 0),
+        **chk)
+
+# ----------------------------------------------------------------------
+# Human-readable report for a single run.
+# ----------------------------------------------------------------------
+def report_run(tag, a, b, g, e, h, r, note=''):
+    log('=' * 72)
+    log(f'RUN {tag}  {note}')
+    log(f'  parameters : alpha={a}, beta={b}, gamma={g}, eps={e}, eta={h}')
+    log(f'  derived    : Lambda=eps(1+gamma/alpha)={fmt(r["Lam"])}, kappa0=alpha+beta={fmt(a+b)}')
+    log(f'  solver     : {METHOD}, rtol={RTOL:g}, atol={ATOL:g}, stop at N<{N_STOP:g}, '
+        f't_end={fmt(r["tend"])}, status={r["status"]}, rate_end={r["rate_end"]:.2e}')
+    log(f'  extrema    : t_N={fmt(r["tN"],6)}, t_P={fmt(r["tP"],6)}, t_L={fmt(r["tL"],6)}, '
+        f'L_max={fmt(r["Lmax"])}, L(end)={fmt(r["L_end"])}   (#max N={r["n_extN"]}, #max P={r["n_extP"]})')
+    log(f'  residuals  : C_inf={fmt(r["C_inf"])}, M_inf={fmt(r["M_inf"])}, H_inf={fmt(r["H_inf"])}, '
+        f'L_term={fmt(r["Lterm"])}')
+    log(f'  cond (20)  : min margin on (0,t_N]={fmt(r["cond_min"])}, at t_N={fmt(r["cond_tN"])} '
+        f'(relative {fmt(r["cond_tN_rel"])}), satisfied={r["cond20_ok"]}')
+    log(f'  order      : t_N<t_P: {r["order_ok"]};  t_P<t_L: {r["order_PL_ok"]};  N\'<0 on (t_N,t_P]: {r["N1_ok"]}')
+    log(f'  linear th. : t_N^lin={fmt(r["tN_lin"],6)} (dev {fmt(r["dev_tN"],3)}), '
+        f't_P^lin={fmt(r["tP_lin"],6)} (dev {fmt(r["dev_tP"],3)})  [valid for Lambda<<1]')
+    log(f'  checks     : H_inf>=exp(-beta*eta/alpha)={fmt(r["H_lower"])}: {r["H_ok"]};  '
+        f'1-H<=eta(1-C): {r["stoich_ok"]};  1-M<=Lambda: {r["M_ok"]};  '
+        f'|inv_M|={r["inv_M"]:.1e}, |inv_C|={r["inv_C"]:.1e}')
+
+# ----------------------------------------------------------------------
+# Figure with the four panels for a typical run.
+# ----------------------------------------------------------------------
+def style():
+    mpl.rcParams.update({
+        'font.size': 11, 'axes.linewidth': 0.8, 'lines.linewidth': 1.6,
+        'legend.frameon': False, 'legend.fontsize': 9,
+        'xtick.direction': 'in', 'ytick.direction': 'in',
+        'xtick.top': True, 'ytick.right': True,
+        'figure.dpi': 120, 'savefig.dpi': 300})
+
+def plot_typical(sol, tag, a, b, g, e, h, r):
+    style()
+    tN, tP, tL, tend = r['tN'], r['tP'], r['tL'], r['tend']
+    tt = np.unique(np.concatenate([np.linspace(0, tend, 8000),
+                                   np.geomspace(1e-3, tend, 3000)]))
+    C, N, P, M, H, Ps, Ns = sol.sol(tt)
+    L = np.where(N > N_FLOOR, P/(e*np.maximum(N, 1e-300)), np.nan)
+    tplot = min(tend, 5*max([x for x in (tL, tP) if np.isfinite(x)] or [5.0]))
+    tl = np.linspace(0, tplot, 4000)
+    yl = sol.sol(tl)
+    Ll = np.where(yl[1] > N_FLOOR, yl[2]/(e*np.maximum(yl[1], 1e-300)), np.nan)
+
+    fig, ax = plt.subplots(2, 2, figsize=(12, 8.5))
+    ax[0,0].plot(tt, C, label='C', color='#1f77b4')
+    ax[0,0].plot(tt, N, label='N', color='#d62728')
+    ax[0,0].plot(tt, P, label='P', color='#2ca02c')
+    for tm, c in [(tN,'#d62728'), (tP,'#2ca02c'), (tL,'#9467bd')]:
+        if np.isfinite(tm): ax[0,0].axvline(tm, color=c, ls=':', lw=0.9, alpha=0.7)
+    ax[0,0].set_xscale('log'); ax[0,0].set_xlabel('t (log)')
+    ax[0,0].set_ylabel('concentration'); ax[0,0].set_title('(a) C, N, P')
+    ax[0,0].legend(ncol=3); ax[0,0].grid(True, alpha=0.25)
+
+    ax[0,1].plot(tt, M, label='M', color='#ff7f0e')
+    ax[0,1].plot(tt, H, label='H', color='#17becf')
+    ax[0,1].set_xscale('log'); ax[0,1].set_xlabel('t (log)')
+    ax[0,1].set_ylabel('concentration'); ax[0,1].set_title('(b) M, H')
+    ax[0,1].legend(); ax[0,1].grid(True, alpha=0.25)
+
+    ax[1,0].plot(tl, Ll, color='#9467bd')
+    for tm, c, lab in [(tN,'#d62728','t_N'), (tP,'#2ca02c','t_P'), (tL,'#9467bd','t_L')]:
+        if np.isfinite(tm): ax[1,0].axvline(tm, color=c, ls=':', lw=0.9, label=lab)
+    ax[1,0].set_xlabel('t'); ax[1,0].set_ylabel('L = P/(eps*N)')
+    ax[1,0].set_title('(c) average chain length'); ax[1,0].legend(); ax[1,0].grid(True, alpha=0.25)
+
+    ax[1,1].plot(tt, Ps, label=r'$P_\Sigma$', color='#8c564b')
+    ax[1,1].plot(tt, Ns, label=r'$N_\Sigma$', color='#e377c2')
+    ax[1,1].set_xscale('log'); ax[1,1].set_xlabel('t (log)')
+    ax[1,1].set_ylabel('concentration'); ax[1,1].set_title(r'(d) $P_\Sigma$, $N_\Sigma$')
+    ax[1,1].legend(); ax[1,1].grid(True, alpha=0.25)
+
+    fig.suptitle(fr'run {tag}: $\alpha={a}$, $\beta={b}$, $\gamma={g}$, $\varepsilon={e}$, $\eta={h}$', y=1.01)
+    plt.tight_layout()
+    fn = f'{OUT}/single_{tag}.pdf'
+    plt.savefig(fn, format='pdf', bbox_inches='tight'); plt.close()
+    return fn
+
+# ----------------------------------------------------------------------
+# LaTeX table with the representative runs.
+# ----------------------------------------------------------------------
+def latex_table(rows, caption, label):
+    L = [r'\begin{table}[htbp]', r'\centering', r'\small',
+         rf'\caption{{{caption}}}', rf'\label{{{label}}}',
+         r'\resizebox{\textwidth}{!}{%', r'\begin{tabular}{l' + 'c'*13 + '}', r'\hline',
+         r'run & $\alpha$ & $\beta$ & $\gamma$ & $\varepsilon$ & $\eta$ & $\Lambda$ & '
+         r'$t_N$ & $t_P$ & $t_L$ & $L_{\max}$ & $C_\infty$ & $M_\infty$ & $H_\infty$ \\', r'\hline']
+    for r in rows:
+        L.append(' & '.join([r['run'], fmt(r['alpha']), fmt(r['beta']), fmt(r['gamma']),
+                             fmt(r['eps']), fmt(r['eta']), fmt(r['Lam'], 3),
+                             fmt(r['tN']), fmt(r['tP']), fmt(r['tL']), fmt(r['Lmax']),
+                             fmt(r['C_inf']), fmt(r['M_inf']), fmt(r['H_inf'])]) + r' \\')
+    L += [r'\hline', r'\end{tabular}}', r'\end{table}']
+    return '\n'.join(L)
+
+# ----------------------------------------------------------------------
+# Parameter sweep. For every combination of (alpha, beta, gamma, eps)
+# the scheme is integrated and analysed. The hydrogen ratio eta is set
+# equal to eps (i.e. H0 = M0), which is the convention used in the
+# representative runs; eta can be varied separately if needed.
+# ----------------------------------------------------------------------
+def sweep(alphas, betas, gammas, epss, tag):
+    rows = []
+    for a, b, g, e in itertools.product(alphas, betas, gammas, epss):
+        h = e
+        try:
+            sol = solve(a, b, g, e, h)
+            r = analyse(sol, a, b, g, e, h)
+            r.update(alpha=a, beta=b, gamma=g, eps=e, eta=h)
+            rows.append(r)
+        except Exception as ex:
+            log(f'FAIL {tag}: a={a}, b={b}, g={g}, e={e}: {ex}')
+    return rows
+
+def summarize(rows, name):
+    """Aggregate statistics over a sweep: how often the ordering holds,
+    how often the sufficient condition is satisfied, whether any run
+    produced more than one extremum, etc."""
+    n = len(rows)
+    s = dict(n=n,
+             order=sum(r['order_ok'] for r in rows),
+             tL_exists=sum(np.isfinite(r['tL']) for r in rows),
+             PL=sum(1 for r in rows if r['order_PL_ok'] is True),
+             cond20=sum(r['cond20_ok'] for r in rows),
+             cond_fail_order_ok=sum(1 for r in rows if (not r['cond20_ok']) and r['order_ok']),
+             not_converged=sum(1 for r in rows if r['status'] != 1),
+             multi_max=sum(1 for r in rows if r['n_extN'] != 1 or r['n_extP'] != 1),
+             checks_fail=sum(1 for r in rows if not (r['H_ok'] and r['stoich_ok'] and r['M_ok'])),
+             min_gap=min([r['tP'] - r['tN'] for r in rows if r['order_ok']] or [np.nan]))
+    log(f'[{name}] n={n}: t_N<t_P in {s["order"]}; t_L exists in {s["tL_exists"]} '
+        f'(t_P<t_L in {s["PL"]}); cond (20) holds in {s["cond20"]}; '
+        f'(20) fails but order holds in {s["cond_fail_order_ok"]}; '
+        f'not converged: {s["not_converged"]}; >1 maximum of N or P: {s["multi_max"]}; '
+        f'bound checks failed: {s["checks_fail"]}; min(t_P-t_N)={fmt(s["min_gap"])}')
+    return s
+
+def save_csv(rows, fn):
+    """Save the main quantities of a sweep to CSV for external analysis."""
+    keys = ['alpha','beta','gamma','eps','eta','Lam','tN','tP','tL','Lmax','C_inf','M_inf','H_inf',
+            'cond_min','cond_tN','order_ok','cond20_ok','tend','status']
+    with open(fn, 'w', newline='') as f:
+        w = csv.writer(f); w.writerow(keys)
+        for r in rows: w.writerow([r.get(k) for k in keys])
+
+# ----------------------------------------------------------------------
+# Main driver: representative runs, cross-check of the numerical
+# methods, a figure, three parameter sweeps, and the LaTeX table.
+# ----------------------------------------------------------------------
+if __name__ == '__main__':
+    log('Listing generated', datetime.datetime.now().isoformat(timespec='seconds'))
+    log(f'python {platform.python_version()}, numpy {np.__version__}, scipy {scipy.__version__}')
+    log(f'method={METHOD}, rtol={RTOL:g}, atol={ATOL:g}, N_STOP={N_STOP:g}, N_FLOOR={N_FLOOR:g}, TMAX={TMAX:g}')
+    log('system: dC/dt=-CM; dN/dt=CM-aN-bNH; dP/dt=eps(CM+g NM)-aP-bPH; dM/dt=-eps(CM+g NM); '
+        'dH/dt=-b*eta*NH;  L=P/(eps N)')
+    report = {}
+
+    # ---- representative runs: three baseline cases plus small-eps and
+    # extreme cases that illustrate the different kinetic regimes ----
+    runs = [('I', 0.1, 0.1, 1000.0, 1.0, 1.0, 'paper, eps=eta=1'),
+            ('II', 10.0, 10.0, 1.0, 1.0, 1.0, 'paper, eps=eta=1'),
+            ('III', 1.0, 1.0, 1.0, 1.0, 1.0, 'paper (baseline), eps=eta=1')]
+    if SMALL_EPS_RUNS:
+        runs += [('A', 0.05, 0.05, 100.0, 1e-5, 1e-5, 'linear regime, Lambda<<1'),
+                 ('B', 0.05, 0.05, 100.0, 1e-3, 1e-3, 'Lambda>1'),
+                 ('C', 0.05, 0.05, 100.0, 5e-4, 5e-4, 'Lambda~1'),
+                 ('D', 0.05, 0.05, 100.0, 1.0, 1.0, 'monomer exhausted'),
+                 ('F', 10.0, 10.0, 0.1, 1.0, 1.0, 'strong deactivation'),
+                 ('G', 1.0, 1.0, 1.0, 0.1, 10.0, 'eta>>1: hydrogen consumed')]
+    table_rows = []
+    sols = {}
+    for tag, a, b, g, e, h, note in runs:
+        sol = solve(a, b, g, e, h)
+        r = analyse(sol, a, b, g, e, h)
+        r.update(run=tag, alpha=a, beta=b, gamma=g, eps=e, eta=h)
+        report_run(tag, a, b, g, e, h, r, note)
+        table_rows.append(r); sols[tag] = (sol, a, b, g, e, h, r)
+    report['table_rows'] = table_rows
+
+    # ---- cross-check: tighten the tolerances and compare the extrema,
+    # and optionally compare Radau with RK45 on the same problem ----
+    log('=' * 72)
+    log('SOLVER CROSS-CHECK (differences of extrema)')
+    for tag, a, b, g, e, h, note in runs:
+        if tag not in ('I', 'II', 'III', 'A'): continue
+        s2 = solve(a, b, g, e, h, 'Radau', 1e-12, 1e-15)
+        r2 = analyse(s2, a, b, g, e, h); r0 = sols[tag][6]
+        line = (f'  {tag}: Radau(1e-10) vs Radau(1e-12): |dt_N|={abs(r0["tN"]-r2["tN"]):.1e}, '
+                f'|dt_P|={abs(r0["tP"]-r2["tP"]):.1e}, |dt_L|={fmt(abs(r0["tL"]-r2["tL"]),2)}')
+        if DO_RK45_CROSSCHECK:
+            try:
+                s3 = solve(a, b, g, e, h, 'RK45', 1e-10, 1e-12)
+                r3 = analyse(s3, a, b, g, e, h)
+                line += (f';  RK45(1e-10) vs Radau(1e-12): |dt_N|={abs(r3["tN"]-r2["tN"]):.1e}, '
+                         f'|dt_P|={abs(r3["tP"]-r2["tP"]):.1e}, |dt_L|={fmt(abs(r3["tL"]-r2["tL"]),2)}')
+            except Exception as ex:
+                line += f';  RK45 failed: {ex}'
+        log(line)
+
+    # ---- figure for the typical run ----
+    sol, a, b, g, e, h, r = sols[TYPICAL]
+    log('plot:', plot_typical(sol, TYPICAL, a, b, g, e, h, r))
+
+    # ---- sweep 1: main grid, all parameter groups varied, eps=eta=1 ----
+    log('=' * 72)
+    sw1 = sweep([0.01, 0.1, 1.0, 10.0], [0.01, 0.1, 1.0, 10.0],
+                [10.0, 100.0, 1000.0, 10000.0], [1.0], 'sweep1')
+    report['sweep1'] = summarize(sw1, 'sweep eps=1')
+    save_csv(sw1, f'{OUT}/sweep1.csv')
+
+    # ---- sweep 2: search for a violation of the sufficient condition
+    # (strong deactivation, small gamma) ----
+    sw2 = sweep([1.0, 10.0, 100.0, 1000.0], [0.1, 1.0, 10.0, 100.0, 1000.0],
+                [1e-3, 1e-2, 1e-1, 1.0], [1.0, 1e-2], 'sweep2')
+    report['sweep2'] = summarize(sw2, 'violation search')
+    save_csv(sw2, f'{OUT}/sweep2.csv')
+
+    # ---- sweep 3: small eps, from the linear regime into the
+    # monomer-limited regime; also compares with the linear prediction ----
+    if SMALL_EPS_RUNS:
+        sw3 = sweep([0.05, 0.5], [0.05, 0.5, 5.0], [10.0, 100.0, 1000.0],
+                    [1e-5, 1e-4, 1e-3, 1e-2, 1e-1], 'sweep3')
+        report['sweep3'] = summarize(sw3, 'small eps')
+        save_csv(sw3, f'{OUT}/sweep3.csv')
+        lin = [r for r in sw3 if r['Lam'] < 0.05]
+        if lin:
+            log(f'  Lambda<0.05: n={len(lin)}, max rel. dev. t_N from linear theory = '
+                f'{max(r["dev_tN"] for r in lin):.2e}, t_P: '
+                f'{max([r["dev_tP"] for r in lin if np.isfinite(r["dev_tP"])] or [np.nan]):.2e}')
+
+    # ---- dependence of t_N on gamma at fixed alpha, beta, eps, eta ----
+    log('=' * 72)
+    gs = [0.1, 1.0, 10.0, 100.0, 1000.0]
+    tN_list = []
+    for g_ in gs:
+        r_ = analyse(solve(0.1, 0.
